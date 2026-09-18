@@ -1,4 +1,4 @@
-# Shipping Document Verification App
+# Shipping Document Checker
 
 A minimal, explainable shipping document verification pipeline for the SDOC
 hackathon. It implements only the required basic workflow:
@@ -31,36 +31,7 @@ The parser uses a fixed alias table for labels such as `Load Port`, `POL`, and
 Unicode, container count, and KG number formatting. It does not use fuzzy
 matching.
 
-## Local-only design
-
-All classification, extraction, normalization, and comparison logic runs on
-the local machine. The application does not call an external API, use an LLM,
-or require an API key. Network access is only needed when you choose to submit
-the generated JSON to an official evaluation endpoint.
-
-## Run the local web interface
-
-Create a virtual environment and install Streamlit:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-```
-
-Start the site:
-
-```bash
-streamlit run app.py
-```
-
-Then open `http://localhost:8501`. The interface provides:
-
-- **Single Case** for uploaded email JSON plus SI/BL attachments;
-- **Full Dataset** with progress, summary, results, and filters;
-- **Submission** generation, schema validation, and JSON download.
-
-## Run from the command line
+## Run
 
 Python 3.10 or newer is sufficient; there are no third-party dependencies.
 

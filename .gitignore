@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .env
-.venv/
 output/
 sdoc-hackathon-bundle/
 sdoc-hackathon-docker/

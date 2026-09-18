@@ -4,16 +4,32 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
+from typing import Any
 
 from src.pipeline import process_inbox, validate_submission
-from src.service import load_inbox_class, write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_BUNDLE = PROJECT_ROOT.parent / "sdoc-hackathon-bundle"
 DEFAULT_OUTPUT = PROJECT_ROOT / "output"
+
+
+def load_inbox_class(bundle: Path) -> type[Any]:
+    loader_path = bundle / "loader.py"
+    spec = importlib.util.spec_from_file_location("participant_loader", loader_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load participant loader: {loader_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Inbox
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
