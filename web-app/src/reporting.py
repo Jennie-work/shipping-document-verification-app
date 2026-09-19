@@ -9,20 +9,11 @@ import json
 from typing import Any
 from xml.sax.saxutils import escape
 
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
-
 from .service import ProcessingArtifacts, comparison_rows
+
+
+class PdfExportUnavailable(RuntimeError):
+    """Raised when the optional local PDF dependency is not installed."""
 
 
 def _generated_at() -> str:
@@ -117,6 +108,26 @@ def _safe(value: Any) -> str:
 
 def results_pdf_bytes(artifacts: ProcessingArtifacts) -> bytes:
     """Build a complete, paginated verification report."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.split(".")[0] == "reportlab":
+            raise PdfExportUnavailable(
+                "PDF export requires reportlab. Run: python -m pip install -r requirements.txt"
+            ) from exc
+        raise
+
     buffer = BytesIO()
     page_size = landscape(A4)
     doc = SimpleDocTemplate(

@@ -54,6 +54,17 @@ Start the site:
 streamlit run app.py
 ```
 
+If Windows reports `No module named 'reportlab'`, run these commands from the
+`web-app` folder using the same Python installation that starts Streamlit:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+The application can still open without ReportLab; JSON and CSV exports remain
+available, and the PDF export explains how to install the missing dependency.
+
 Then open `http://localhost:8501`. The interface provides:
 
 - **Single Case** for uploaded email JSON plus SI/BL attachments;

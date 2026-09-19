@@ -13,7 +13,12 @@ import streamlit as st
 
 from src.pipeline import validate_submission
 from src.extract import FIELDS
-from src.reporting import results_csv_bytes, results_json_bytes, results_pdf_bytes
+from src.reporting import (
+    PdfExportUnavailable,
+    results_csv_bytes,
+    results_json_bytes,
+    results_pdf_bytes,
+)
 from src.service import (
     FIELD_LABELS,
     ProcessingArtifacts,
@@ -1287,18 +1292,25 @@ else:
         ):
             try:
                 with st.spinner("Building report files..."):
-                    st.session_state.export_files = {
+                    exports = {
                         "json": results_json_bytes(artifacts),
                         "csv": results_csv_bytes(artifacts),
-                        "pdf": results_pdf_bytes(artifacts),
                     }
-                st.success("Report files are ready to download.")
+                    try:
+                        exports["pdf"] = results_pdf_bytes(artifacts)
+                    except PdfExportUnavailable as exc:
+                        st.warning(str(exc))
+                    st.session_state.export_files = exports
+                if "pdf" in exports:
+                    st.success("JSON, CSV, and PDF reports are ready to download.")
+                else:
+                    st.success("JSON and CSV reports are ready to download.")
             except Exception as exc:
                 st.session_state.pop("export_files", None)
                 st.error(f"Report generation failed: {exc}")
         if st.session_state.get("export_files"):
             exports = st.session_state.export_files
-            download_columns = st.columns(3)
+            download_columns = st.columns(3 if "pdf" in exports else 2)
             download_columns[0].download_button(
                 "Download results.json",
                 data=exports["json"],
@@ -1313,13 +1325,14 @@ else:
                 mime="text/csv",
                 width="stretch",
             )
-            download_columns[2].download_button(
-                "Download report.pdf",
-                data=exports["pdf"],
-                file_name="verification-report.pdf",
-                mime="application/pdf",
-                width="stretch",
-            )
+            if "pdf" in exports:
+                download_columns[2].download_button(
+                    "Download report.pdf",
+                    data=exports["pdf"],
+                    file_name="verification-report.pdf",
+                    mime="application/pdf",
+                    width="stretch",
+                )
 
         section_label("Official submission")
         if st.button("Validate submission", type="primary", width="stretch", key="generate_submission"):
