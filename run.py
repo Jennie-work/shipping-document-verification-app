@@ -13,12 +13,29 @@ from src.pipeline import process_inbox, validate_submission
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_BUNDLE = PROJECT_ROOT.parent / "sdoc-hackathon-bundle"
 DEFAULT_OUTPUT = PROJECT_ROOT / "output"
+
+
+def find_default_bundle() -> Path:
+    """Prefer the bundle shipped with this repo, while supporting the old layout."""
+    candidates = (
+        PROJECT_ROOT / "local-data" / "participant-bundle",
+        PROJECT_ROOT.parent / "sdoc-hackathon-bundle",
+    )
+    return next((path for path in candidates if (path / "loader.py").is_file()), candidates[0])
+
+
+DEFAULT_BUNDLE = find_default_bundle()
 
 
 def load_inbox_class(bundle: Path) -> type[Any]:
     loader_path = bundle / "loader.py"
+    if not loader_path.is_file():
+        raise FileNotFoundError(
+            f"Participant bundle not found at {bundle}. "
+            "Pass its location with --bundle, or place it at "
+            f"{PROJECT_ROOT / 'local-data' / 'participant-bundle'}."
+        )
     spec = importlib.util.spec_from_file_location("participant_loader", loader_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load participant loader: {loader_path}")

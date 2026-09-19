@@ -39,8 +39,8 @@ Python 3.10 or newer is sufficient; there are no third-party dependencies.
 python3 run.py --bundle /path/to/sdoc-hackathon-bundle
 ```
 
-When `sdoc-hackathon-bundle` is next to this repository, this shorter command
-uses it automatically:
+The repository's bundled sample data at `local-data/participant-bundle` is used
+automatically, so the shorter command works after cloning:
 
 ```bash
 python3 run.py
