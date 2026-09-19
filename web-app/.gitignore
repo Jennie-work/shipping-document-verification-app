@@ -4,6 +4,7 @@ __pycache__/
 .env
 .venv/
 output/
+tmp/
 sdoc-hackathon-bundle/
 sdoc-hackathon-docker/
 ground_truth.json

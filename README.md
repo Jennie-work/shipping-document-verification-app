@@ -33,9 +33,26 @@ matching.
 
 ## Run
 
-Python 3.10 or newer is sufficient; there are no third-party dependencies.
+### Web interface
 
 ```bash
+cd web-app
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+streamlit run app.py
+```
+
+Open `http://localhost:8501`. The interface includes inbox analysis, recorded
+processing errors with retry, a human review dashboard, comparison results,
+and JSON/CSV/PDF exports.
+
+### Command line
+
+Python 3.10 or newer is sufficient for the command-line pipeline.
+
+```bash
+cd web-app
 python3 run.py --bundle /path/to/sdoc-hackathon-bundle
 ```
 
@@ -43,6 +60,7 @@ The repository's bundled sample data at `local-data/participant-bundle` is used
 automatically, so the shorter command works after cloning:
 
 ```bash
+cd web-app
 python3 run.py
 ```
 
@@ -51,6 +69,8 @@ The command writes:
 - `output/submission.json`: the official submission shape;
 - `output/results.json`: extracted values, mismatch evidence, and manual-review details;
 - `output/summary.json`: run counts.
+- `output/errors.json`: processing error and retry history;
+- `output/review_decisions.json`: saved human review decisions.
 
 Generated output and hackathon datasets are excluded from Git. If an official
 local evaluation server is already running, submit through its public endpoint:
@@ -60,5 +80,5 @@ python3 run.py --bundle /path/to/sdoc-hackathon-bundle \
   --submit-url http://localhost:8080
 ```
 
-This repository does not contain the participant dataset, organizer package,
-or private answer key.
+The application reads only `local-data/participant-bundle`. It does not read
+organizer evaluation files or a private answer key.

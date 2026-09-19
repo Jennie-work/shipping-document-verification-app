@@ -12,14 +12,18 @@ from typing import Any
 import streamlit as st
 
 from src.pipeline import validate_submission
+from src.extract import FIELDS
+from src.reporting import results_csv_bytes, results_json_bytes, results_pdf_bytes
 from src.service import (
     FIELD_LABELS,
     ProcessingArtifacts,
     UploadedAttachment,
+    apply_human_review,
     comparison_rows,
     dataset_rows,
     process_dataset,
     process_single_email,
+    retry_failed_email,
     submission_bytes,
     write_artifacts,
 )
@@ -711,7 +715,14 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
     )
 
     mismatches = [k for k, v in artifacts.submission.items() if v["status"] == "MISMATCH"]
-    reviews = [k for k, v in artifacts.submission.items() if v["status"] == "NEEDS_REVIEW"]
+    failed = [
+        k for k, detail in artifacts.internal_results.items()
+        if detail.get("processing_status", detail.get("task_status")) == "Failed"
+    ]
+    reviews = [
+        k for k, v in artifacts.submission.items()
+        if v["status"] == "NEEDS_REVIEW" and k not in failed
+    ]
     cleared = [
         k for k, v in artifacts.submission.items()
         if v["category"] == "BL_COMPARISON" and v["status"] == "OK"
@@ -736,10 +747,11 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
         ("All files", f"• All files ({len(artifacts.emails)})", list(email_by_id)),
         ("Mismatches", f"! Mismatch ({len(mismatches)})", mismatches),
         ("Human review", f"? Human Review ({len(reviews)})", reviews),
+        ("Failed", f"× Failed ({len(failed)})", failed),
         ("Passed", f"✓ Passed ({len(cleared)})", cleared),
     ]
 
-    cols = st.columns(4)
+    cols = st.columns(5)
 
     for col, (name, label, _) in zip(cols, buckets):
         with col:
@@ -756,6 +768,7 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
         "All files": list(email_by_id),
         "Mismatches": mismatches,
         "Human review": reviews,
+        "Failed": failed,
         "Passed": cleared,
     }[st.session_state.inbox_bucket]
 
@@ -797,7 +810,11 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
         subject = str(email.get("subject", "Untitled"))
         result = artifacts.submission[email_id]
 
-        if result["status"] == "MISMATCH":
+        detail = artifacts.internal_results[email_id]
+        if detail.get("processing_status", detail.get("task_status")) == "Failed":
+            status = "Failed"
+            css = "mismatch"
+        elif result["status"] == "MISMATCH":
             status = "Mismatch"
             css = "mismatch"
         elif result["status"] == "NEEDS_REVIEW":
@@ -834,8 +851,6 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
 
             # IMPORTANT: detail appears directly under the selected item
             if expanded:
-                detail = artifacts.internal_results[email_id]
-
                 st.markdown("### Verification details")
 
                 tab1, tab2, tab3 = st.tabs(
@@ -861,58 +876,192 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
                     )
                     if result.get("review_reason"):
                         st.write(result["review_reason"])
+                    if detail.get("error_history"):
+                        latest = detail["error_history"][-1]
+                        st.error(f"{latest.get('type', 'Error')}: {latest.get('message', 'Unknown processing error')}")
+                        st.caption(
+                            f"Attempts: {detail.get('processing_attempts', 1)} · "
+                            f"Retries: {detail.get('retry_count', 0)}"
+                        )
 
     if not filtered:
         st.info("No files match this search.")
 
 
-def render_requirement_summary(result, detail, email):
-    """
-    Additional requirement-focused explanation:
-    - mismatch summary
-    - human review context
-    - source evidence visibility
-    """
-    if result.get("status") == "MISMATCH":
-        st.markdown("### Mismatch summary")
-        mismatches = detail.get("mismatches", [])
+def render_error_history(detail: dict[str, Any]) -> None:
+    errors = detail.get("error_history", [])
+    if not errors:
+        st.info("No processing errors were recorded for this case.")
+        return
+    for index, item in enumerate(reversed(errors), start=1):
+        with st.expander(
+            f"Error {len(errors) - index + 1} · {item.get('type', 'Error')} · {item.get('at', 'Unknown time')}",
+            expanded=index == 1,
+        ):
+            st.code(item.get("message", "Unknown processing error"), language=None)
+            if item.get("traceback"):
+                st.code(item["traceback"], language="text")
 
-        if mismatches:
-            for item in mismatches:
-                st.markdown(
-                    f"""
-                    <div class="mismatch-row">
-                    <b>{item.get('field','Unknown field')}</b><br>
-                    SI: {item.get('si_value','-')}<br>
-                    BL: {item.get('bl_value','-')}
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+
+def render_human_review_dashboard(
+    artifacts: ProcessingArtifacts, dataset_bundle: str
+) -> None:
+    email_by_id = {email["email_id"]: email for email in artifacts.emails}
+    failed = [
+        email_id
+        for email_id, detail in artifacts.internal_results.items()
+        if detail.get("processing_status", detail.get("task_status")) == "Failed"
+    ]
+    pending = [
+        email_id
+        for email_id, result in artifacts.submission.items()
+        if result["status"] == "NEEDS_REVIEW" and email_id not in failed
+    ]
+    resolved = [
+        email_id
+        for email_id, detail in artifacts.internal_results.items()
+        if detail.get("review_state") in {"confirmed", "corrected"}
+    ]
+
+    if st.session_state.pop("review_notice", None):
+        st.success("Human review saved and result recalculated.")
+    if st.session_state.pop("retry_notice", None):
+        st.success("Retry completed. The case status and error history were updated.")
+
+    metrics = st.columns(3)
+    metrics[0].metric("Pending review", len(pending))
+    metrics[1].metric("Failed processing", len(failed))
+    metrics[2].metric("Reviewed", len(resolved))
+
+    review_tab, failed_tab, resolved_tab = st.tabs(
+        ["Manual verification", "Processing errors", "Completed reviews"]
+    )
+
+    with review_tab:
+        if not pending:
+            st.success("No cases are waiting for manual verification.")
         else:
-            st.info("Mismatch detected. Review comparison details.")
+            selected = st.selectbox(
+                "Choose a case",
+                pending,
+                format_func=lambda email_id: (
+                    f"{email_id} · {email_by_id[email_id].get('subject', 'Untitled')}"
+                ),
+                key="human_review_case",
+            )
+            result = artifacts.submission[selected]
+            detail = artifacts.internal_results[selected]
+            email = email_by_id[selected]
+            st.caption(
+                f"Reason: {result.get('review_reason') or detail.get('internal_reason') or 'Verification required'}"
+            )
+            st.write(email.get("body", ""))
+            st.dataframe(comparison_rows(detail), hide_index=True, width="stretch")
+            st.markdown("### Confirm or correct extracted values")
+            st.caption(
+                "SI is the reference. Enter all seven SI and BL values, then save the review. "
+                "The comparison result will be recalculated without changing the official schema."
+            )
+            extracted = detail.get("extracted", {})
+            with st.form(f"review_form_{selected}"):
+                header = st.columns([1.2, 2, 2])
+                header[0].markdown("**Field**")
+                header[1].markdown("**SI value**")
+                header[2].markdown("**BL value**")
+                si_values: dict[str, str] = {}
+                bl_values: dict[str, str] = {}
+                for field in FIELDS:
+                    columns = st.columns([1.2, 2, 2])
+                    columns[0].write(FIELD_LABELS[field])
+                    si_values[field] = columns[1].text_input(
+                        f"SI {FIELD_LABELS[field]}",
+                        value=str(extracted.get("si", {}).get(field, "") or ""),
+                        label_visibility="collapsed",
+                        key=f"review_{selected}_si_{field}",
+                    )
+                    bl_values[field] = columns[2].text_input(
+                        f"BL {FIELD_LABELS[field]}",
+                        value=str(extracted.get("bl", {}).get(field, "") or ""),
+                        label_visibility="collapsed",
+                        key=f"review_{selected}_bl_{field}",
+                    )
+                note = st.text_area(
+                    "Reviewer note",
+                    placeholder="Optional note explaining the confirmation or correction",
+                    key=f"review_note_{selected}",
+                )
+                save_review = st.form_submit_button(
+                    "Save review and recalculate", type="primary", width="stretch"
+                )
+            if save_review:
+                try:
+                    updated = apply_human_review(
+                        artifacts, selected, si_values, bl_values, note
+                    )
+                    st.session_state.dataset_artifacts = updated
+                    st.session_state.submission_ready = False
+                    st.session_state.pop("export_files", None)
+                    write_artifacts(updated, DEFAULT_OUTPUT)
+                    st.session_state.review_notice = True
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
 
-    elif result.get("status") == "NEEDS_REVIEW":
-        st.markdown("### Human review context")
-        reason = result.get("review_reason", "Additional verification required.")
+    with failed_tab:
+        if not failed:
+            st.success("No failed processing cases.")
+        else:
+            selected_failed = st.selectbox(
+                "Choose a failed case",
+                failed,
+                format_func=lambda email_id: (
+                    f"{email_id} · {email_by_id[email_id].get('subject', 'Untitled')}"
+                ),
+                key="failed_review_case",
+            )
+            failed_detail = artifacts.internal_results[selected_failed]
+            st.caption(
+                f"Attempts: {failed_detail.get('processing_attempts', 1)} · "
+                f"Retries: {failed_detail.get('retry_count', 0)}"
+            )
+            render_error_history(failed_detail)
+            if st.button(
+                "Retry failed processing",
+                type="primary",
+                width="stretch",
+                key=f"retry_{selected_failed}",
+            ):
+                try:
+                    updated = retry_failed_email(
+                        dataset_bundle, artifacts, selected_failed
+                    )
+                    st.session_state.dataset_artifacts = updated
+                    st.session_state.submission_ready = False
+                    st.session_state.pop("export_files", None)
+                    write_artifacts(updated, DEFAULT_OUTPUT)
+                    st.session_state.retry_notice = True
+                    st.rerun()
+                except (OSError, KeyError, ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
 
-        st.markdown(
-            f"""
-            <div class="review-row">
-            <b>Reason</b><br>
-            {reason}<br><br>
-            <b>Email</b><br>
-            {email.get('email_id','-')}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        if st.button("Retry analysis", key="retry_analysis"):
-            st.info("Retry request queued.")
-
-    else:
-        st.success("No mismatch detected. No action required.")
+    with resolved_tab:
+        if not resolved:
+            st.info("No human review decisions have been saved yet.")
+        else:
+            rows = []
+            for email_id in resolved:
+                review = artifacts.internal_results[email_id]["human_review"]
+                rows.append(
+                    {
+                        "email_id": email_id,
+                        "subject": email_by_id[email_id].get("subject", ""),
+                        "decision": review.get("decision", ""),
+                        "reviewed_at": review.get("reviewed_at", ""),
+                        "result": artifacts.submission[email_id]["status"],
+                        "note": review.get("note", ""),
+                    }
+                )
+            st.dataframe(rows, hide_index=True, width="stretch")
 
 
 with st.sidebar:
@@ -926,6 +1075,7 @@ with st.sidebar:
         ("Home", "Dashboard"),
         ("Check one case", "Verify one request"),
         ("Analyze inbox", "Inbox operations"),
+        ("Human review", "Human review"),
         ("Export results", "Submission center"),
     ]
     for destination, label in nav_items:
@@ -942,6 +1092,7 @@ page_titles = {
     "Home": ("Operations Workspace", "Monitor document checks and start your next task."),
     "Check one case": ("Verify One Request", "Check an email, Shipping Instruction and draft Bill of Lading."),
     "Analyze inbox": ("Inbox Operations", "Turn incoming shipping emails into a prioritized action queue."),
+    "Human review": ("Human Review", "Confirm uncertain values, correct extraction results, and retry failed cases."),
     "Export results": ("Submission Center", "Validate and download the final verification results."),
 }
 banner_title, banner_copy = page_titles[page]
@@ -1050,6 +1201,8 @@ elif page == "Analyze inbox":
             artifacts = run_dataset_with_progress(bundle_path)
             st.session_state.dataset_artifacts = artifacts
             st.session_state.dataset_bundle = str(Path(bundle_path).expanduser().resolve())
+            st.session_state.submission_ready = False
+            st.session_state.pop("export_files", None)
             write_artifacts(artifacts, DEFAULT_OUTPUT)
             st.success("Inbox analysis completed successfully.")
         except (OSError, ValueError, RuntimeError) as exc:
@@ -1058,13 +1211,79 @@ elif page == "Analyze inbox":
         render_summary(st.session_state.dataset_artifacts)
         render_inbox_workspace(st.session_state.dataset_artifacts)
 
+elif page == "Human review":
+    st.markdown(
+        '<div class="page-intro"><div class="page-title">Human review dashboard</div><div class="page-copy">Resolve uncertain cases by confirming or correcting all seven extracted fields. Processing failures keep their complete error history and can be retried individually.</div></div>',
+        unsafe_allow_html=True,
+    )
+    artifacts = st.session_state.get("dataset_artifacts")
+    if artifacts is None:
+        st.warning(
+            "No inbox results yet. Open **Inbox operations** and run the analysis first."
+        )
+    else:
+        render_human_review_dashboard(
+            artifacts,
+            st.session_state.get("dataset_bundle", bundle_path),
+        )
+
 else:
-    st.markdown('<div class="page-intro"><div class="page-title">Export verified results</div><div class="page-copy">Generate the submission file only after the full inbox has been analyzed. CargoCheck validates the format and confirms that every email is included.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-intro"><div class="page-title">Report and export</div><div class="page-copy">Review the comparison results, download operational reports in JSON, CSV, or PDF, and validate the official submission file.</div></div>', unsafe_allow_html=True)
     artifacts = st.session_state.get("dataset_artifacts")
     if artifacts is None:
         st.warning("No inbox results yet. Open **Analyze inbox** from the left menu and run the analysis first.")
     else:
         render_summary(artifacts)
+        section_label("Comparison results")
+        render_dataset_table(artifacts)
+
+        section_label("Operational report exports")
+        st.caption(
+            "These reports include comparison values, processing errors, retries, and human review decisions."
+        )
+        if st.button(
+            "Prepare JSON, CSV and PDF reports",
+            type="primary",
+            width="stretch",
+            key="prepare_reports",
+        ):
+            try:
+                with st.spinner("Building report files..."):
+                    st.session_state.export_files = {
+                        "json": results_json_bytes(artifacts),
+                        "csv": results_csv_bytes(artifacts),
+                        "pdf": results_pdf_bytes(artifacts),
+                    }
+                st.success("Report files are ready to download.")
+            except Exception as exc:
+                st.session_state.pop("export_files", None)
+                st.error(f"Report generation failed: {exc}")
+        if st.session_state.get("export_files"):
+            exports = st.session_state.export_files
+            download_columns = st.columns(3)
+            download_columns[0].download_button(
+                "Download results.json",
+                data=exports["json"],
+                file_name="verification-results.json",
+                mime="application/json",
+                width="stretch",
+            )
+            download_columns[1].download_button(
+                "Download results.csv",
+                data=exports["csv"],
+                file_name="verification-results.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+            download_columns[2].download_button(
+                "Download report.pdf",
+                data=exports["pdf"],
+                file_name="verification-report.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
+
+        section_label("Official submission")
         if st.button("Validate submission", type="primary", width="stretch", key="generate_submission"):
             try:
                 resolved_bundle = str(Path(bundle_path).expanduser().resolve())

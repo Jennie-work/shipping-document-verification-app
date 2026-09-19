@@ -59,6 +59,14 @@ Then open `http://localhost:8501`. The interface provides:
 - **Single Case** for uploaded email JSON plus SI/BL attachments;
 - **Full Dataset** with progress, summary, results, and filters;
 - **Submission** generation, schema validation, and JSON download.
+- **Error handling** with per-case error history, attempt counts, and retry;
+- **Human Review** for confirming or correcting all seven SI/BL fields;
+- **Report & Export** with complete JSON, CSV, and paginated PDF reports.
+
+The Human Review page recalculates the comparison after a reviewer saves all
+seven SI and BL values. The original extracted values, reviewed values,
+decision, time, and reviewer note are retained in the internal result. Failed
+processing stays isolated to the affected email and does not stop the inbox.
 
 Each processed case also includes:
 
@@ -91,6 +99,14 @@ The command writes:
 - `output/submission.json`: the official submission shape;
 - `output/results.json`: extracted values, mismatch evidence, and manual-review details;
 - `output/summary.json`: run counts.
+- `output/errors.json`: recorded per-case processing errors and retry history;
+- `output/review_decisions.json`: confirmed or corrected human-review decisions.
+
+The web interface can additionally download:
+
+- `verification-results.json`: complete operational results;
+- `verification-results.csv`: email and field-level comparison rows;
+- `verification-report.pdf`: summary, all cases, and action-required details.
 
 Generated output and hackathon datasets are excluded from Git. If an official
 local evaluation server is already running, submit through its public endpoint:
@@ -100,5 +116,5 @@ python3 run.py --bundle /path/to/sdoc-hackathon-bundle \
   --submit-url http://localhost:8080
 ```
 
-This repository does not contain the participant dataset, organizer package,
-or private answer key.
+The application reads only `local-data/participant-bundle`. It does not read
+organizer evaluation files or a private answer key.

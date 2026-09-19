@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from src.pipeline import process_inbox, validate_submission
-from src.service import load_inbox_class, write_json
+from src.service import ProcessingArtifacts, load_inbox_class, write_artifacts, write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -48,13 +48,13 @@ def main() -> int:
     submission, internal_results, summary = process_inbox(inbox)
     validate_submission(submission, inbox.sample_submission())
 
-    write_json(output_dir / "submission.json", submission)
-    write_json(output_dir / "results.json", internal_results)
+    artifacts = ProcessingArtifacts(inbox.emails(), submission, internal_results, summary)
+    write_artifacts(artifacts, output_dir)
     if args.submit_url:
         score = Inbox(args.submit_url).submit(submission)
         write_json(output_dir / "self_evaluation.json", score)
         summary["self_evaluation"] = score
-    write_json(output_dir / "summary.json", summary)
+        write_artifacts(artifacts, output_dir)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 0
 

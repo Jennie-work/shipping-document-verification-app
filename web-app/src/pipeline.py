@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+import traceback
 from typing import Any, Callable
 
 from .classify import BL_COMPARISON, classify_email
@@ -26,6 +27,15 @@ def _history(final_status: str) -> list[dict[str, str]]:
         {"status": "Processing", "at": now},
         {"status": final_status, "at": now},
     ]
+
+
+def _error_entry(exc: Exception) -> dict[str, str]:
+    return {
+        "at": _timestamp(),
+        "type": type(exc).__name__,
+        "message": str(exc) or repr(exc),
+        "traceback": traceback.format_exc(),
+    }
 
 
 DEFAULT_RESULT = {
@@ -77,7 +87,39 @@ def _process_comparison(
             "field_confidence": {},
             "mismatches": [],
             "task_status": "Review",
+            "processing_status": "Review Required",
+            "processing_attempts": 1,
+            "retry_count": 0,
+            "retryable": False,
+            "error_history": [],
             "status_history": _history("Review"),
+        }
+        return submission, detail
+    except Exception as exc:  # Keep one bad attachment from stopping the inbox.
+        submission = {
+            "status": "NEEDS_REVIEW",
+            "review_reason": "unreadable",
+            "defect_fields": [],
+            "has_defect": False,
+        }
+        detail = {
+            "status": "NEEDS_REVIEW",
+            "message": "Processing failed. Retry or send the case to a human reviewer.",
+            "review_reason": "unreadable",
+            "internal_reason": "processing_error",
+            "detail": str(exc) or repr(exc),
+            "attachments": paths or list(email.get("attachments", [])),
+            "extracted": extracted,
+            "evidence": evidence,
+            "field_confidence": {},
+            "mismatches": [],
+            "task_status": "Failed",
+            "processing_status": "Failed",
+            "processing_attempts": 1,
+            "retry_count": 0,
+            "retryable": True,
+            "error_history": [_error_entry(exc)],
+            "status_history": _history("Failed"),
         }
         return submission, detail
 
@@ -100,9 +142,49 @@ def _process_comparison(
             for field in extracted["si"]
         },
         "task_status": "Completed",
+        "processing_status": "Completed",
+        "processing_attempts": 1,
+        "retry_count": 0,
+        "retryable": False,
+        "error_history": [],
         "status_history": _history("Completed"),
     }
     return submission, detail
+
+
+def summarize_results(
+    submission: dict[str, Any], internal_results: dict[str, Any]
+) -> dict[str, Any]:
+    """Rebuild summary counts after retries or human review edits."""
+    category_counts = Counter(record["category"] for record in submission.values())
+    status_counts = Counter(record["status"] for record in submission.values())
+    review_counts = Counter(
+        record["review_reason"]
+        for record in submission.values()
+        if record["review_reason"] is not None
+    )
+    comparisons = [record for record in submission.values() if record["category"] == BL_COMPARISON]
+    failed = sum(
+        detail.get("processing_status", detail.get("task_status")) == "Failed"
+        for detail in internal_results.values()
+    )
+    resolved_reviews = sum(
+        detail.get("review_state") in {"confirmed", "corrected"}
+        for detail in internal_results.values()
+    )
+    return {
+        "emails_processed": len(submission),
+        "category_counts": dict(sorted(category_counts.items())),
+        "comparison_requests": len(comparisons),
+        "comparisons_completed": sum(r["status"] in {"OK", "MISMATCH"} for r in comparisons),
+        "no_mismatch": sum(r["status"] == "OK" for r in comparisons),
+        "mismatch": sum(r["status"] == "MISMATCH" for r in comparisons),
+        "manual_review": sum(r["status"] == "NEEDS_REVIEW" for r in comparisons),
+        "failed": failed,
+        "resolved_reviews": resolved_reviews,
+        "review_reason_counts": dict(sorted(review_counts.items())),
+        "status_counts": dict(sorted(status_counts.items())),
+    }
 
 
 def process_inbox(
@@ -134,6 +216,11 @@ def process_inbox(
                 "field_confidence": {},
                 "mismatches": [],
                 "task_status": "Completed",
+                "processing_status": "Completed",
+                "processing_attempts": 1,
+                "retry_count": 0,
+                "retryable": False,
+                "error_history": [],
                 "status_history": _history("Completed"),
             }
 
@@ -147,29 +234,15 @@ def process_inbox(
             **detail,
         }
         if stage_callback:
-            final_stage = "Queued for human review" if detail["task_status"] == "Review" else "Completed"
+            final_stage = (
+                "Processing failed"
+                if detail["task_status"] == "Failed"
+                else "Queued for human review"
+                if detail["task_status"] == "Review"
+                else "Completed"
+            )
             stage_callback(email_id, final_stage)
-
-    category_counts = Counter(record["category"] for record in submission.values())
-    status_counts = Counter(record["status"] for record in submission.values())
-    review_counts = Counter(
-        record["review_reason"]
-        for record in submission.values()
-        if record["review_reason"] is not None
-    )
-    comparisons = [record for record in submission.values() if record["category"] == BL_COMPARISON]
-    summary = {
-        "emails_processed": len(submission),
-        "category_counts": dict(sorted(category_counts.items())),
-        "comparison_requests": len(comparisons),
-        "comparisons_completed": sum(r["status"] in {"OK", "MISMATCH"} for r in comparisons),
-        "no_mismatch": sum(r["status"] == "OK" for r in comparisons),
-        "mismatch": sum(r["status"] == "MISMATCH" for r in comparisons),
-        "manual_review": sum(r["status"] == "NEEDS_REVIEW" for r in comparisons),
-        "review_reason_counts": dict(sorted(review_counts.items())),
-        "status_counts": dict(sorted(status_counts.items())),
-    }
-    return submission, internal_results, summary
+    return submission, internal_results, summarize_results(submission, internal_results)
 
 
 def validate_submission(submission: dict[str, Any], sample: dict[str, Any]) -> None:

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib.util
 import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .extract import FIELDS
+from .compare import compare_documents
+from .extract import FIELDS, ReviewRequired
 from .normalize import normalize_field
-from .pipeline import process_inbox, validate_submission
+from .pipeline import process_inbox, summarize_results, validate_submission
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -70,6 +73,20 @@ class ProgressInbox:
         for index, email in enumerate(self._emails):
             self._callback(index, total, email["email_id"])
             yield email
+
+    def read_bytes(self, path: str) -> bytes:
+        return self._inbox.read_bytes(path)
+
+
+class SingleEmailInbox:
+    """One-record view over a local inbox, used for safe per-case retries."""
+
+    def __init__(self, inbox: Any, email: dict[str, Any]):
+        self._inbox = inbox
+        self._email = email
+
+    def __iter__(self):
+        return iter([self._email])
 
     def read_bytes(self, path: str) -> bytes:
         return self._inbox.read_bytes(path)
@@ -152,6 +169,142 @@ def process_single_email(
     return ProcessingArtifacts([prepared], submission, internal_results, summary)
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def retry_failed_email(
+    bundle_path: str | Path,
+    artifacts: ProcessingArtifacts,
+    email_id: str,
+) -> ProcessingArtifacts:
+    """Re-run one failed email and merge the new result into the dataset."""
+    if email_id not in artifacts.internal_results:
+        raise KeyError(f"Unknown email ID: {email_id}")
+    previous = artifacts.internal_results[email_id]
+    if previous.get("processing_status", previous.get("task_status")) != "Failed":
+        raise ValueError(f"{email_id} is not a failed case")
+
+    inbox = open_local_inbox(bundle_path)
+    email = inbox.get(email_id)
+    submission, internal_results, _ = process_inbox(SingleEmailInbox(inbox, email))
+    retried = internal_results[email_id]
+    attempt = int(previous.get("processing_attempts", 1)) + 1
+    retried["processing_attempts"] = attempt
+    retried["retry_count"] = int(previous.get("retry_count", 0)) + 1
+    retried["last_retry_at"] = _now()
+    retried["error_history"] = [
+        *previous.get("error_history", []),
+        *retried.get("error_history", []),
+    ]
+    retried["status_history"] = [
+        *previous.get("status_history", []),
+        {"status": "Retrying", "at": retried["last_retry_at"]},
+        *retried.get("status_history", [])[1:],
+    ]
+
+    updated = deepcopy(artifacts)
+    updated.submission[email_id] = submission[email_id]
+    updated.internal_results[email_id] = retried
+    updated.summary = summarize_results(updated.submission, updated.internal_results)
+    return updated
+
+
+def apply_human_review(
+    artifacts: ProcessingArtifacts,
+    email_id: str,
+    si_values: dict[str, str],
+    bl_values: dict[str, str],
+    note: str = "",
+) -> ProcessingArtifacts:
+    """Confirm or correct all seven fields and resolve a manual-review case."""
+    if email_id not in artifacts.submission:
+        raise KeyError(f"Unknown email ID: {email_id}")
+    if artifacts.submission[email_id]["category"] != "BL_COMPARISON":
+        raise ValueError("Only document comparison cases can be reviewed")
+
+    cleaned: dict[str, dict[str, str]] = {"si": {}, "bl": {}}
+    missing: list[str] = []
+    for role, values in (("si", si_values), ("bl", bl_values)):
+        for field in FIELDS:
+            value = str(values.get(field, "")).strip()
+            if not value:
+                missing.append(f"{role.upper()} {FIELD_LABELS[field]}")
+            cleaned[role][field] = value
+    if missing:
+        raise ValueError("Enter a value for: " + ", ".join(missing))
+
+    updated = deepcopy(artifacts)
+    previous = updated.internal_results[email_id]
+    original = deepcopy(previous.get("extracted", {}))
+    try:
+        comparison = compare_documents(cleaned["si"], cleaned["bl"])
+    except ReviewRequired as exc:
+        raise ValueError(
+            "One or more reviewed values use an unsupported format: " + exc.detail
+        ) from exc
+    defect_fields = [item["field"] for item in comparison["mismatches"]]
+    changed = any(
+        str(original.get(role, {}).get(field, "")).strip() != cleaned[role][field]
+        for role in ("si", "bl")
+        for field in FIELDS
+    )
+    decision = "corrected" if changed else "confirmed"
+    reviewed_at = _now()
+
+    updated.submission[email_id] = {
+        "category": "BL_COMPARISON",
+        "status": comparison["status"],
+        "review_reason": None,
+        "defect_fields": defect_fields,
+        "has_defect": bool(defect_fields),
+    }
+    previous.update(
+        {
+            **comparison,
+            "review_reason": None,
+            "internal_reason": None,
+            "detail": None,
+            "extracted": cleaned,
+            "field_confidence": {field: 1.0 for field in FIELDS},
+            "task_status": "Completed",
+            "processing_status": "Completed",
+            "retryable": False,
+            "review_state": decision,
+            "human_review": {
+                "decision": decision,
+                "reviewed_at": reviewed_at,
+                "note": note.strip(),
+                "original_extracted": original,
+                "reviewed_values": deepcopy(cleaned),
+            },
+            "status_history": [
+                *previous.get("status_history", []),
+                {"status": "Human Review", "at": reviewed_at},
+                {"status": "Completed", "at": reviewed_at},
+            ],
+        }
+    )
+    evidence = previous.setdefault("evidence", {})
+    for role in ("si", "bl"):
+        role_evidence = evidence.setdefault(role, {})
+        for field in FIELDS:
+            if str(original.get(role, {}).get(field, "")).strip() != cleaned[role][field]:
+                role_evidence[field] = {
+                    "source": "Human review correction",
+                    "page": 1,
+                    "line_start": "manual",
+                    "line_end": "manual",
+                    "label": FIELD_LABELS[field],
+                    "excerpt": cleaned[role][field],
+                    "confidence": 1.0,
+                }
+
+    updated.internal_results[email_id] = previous
+    updated.summary = summarize_results(updated.submission, updated.internal_results)
+    return updated
+
+
 def comparison_rows(detail: dict[str, Any]) -> list[dict[str, str]]:
     extracted = detail.get("extracted", {})
     si_fields = extracted.get("si", {})
@@ -195,6 +348,7 @@ def dataset_rows(artifacts: ProcessingArtifacts) -> list[dict[str, str]]:
                 "category": result["category"],
                 "confidence": f"{artifacts.internal_results[email_id].get('classification_confidence', 0):.0%}",
                 "task status": artifacts.internal_results[email_id].get("task_status", "Completed"),
+                "processing attempts": str(artifacts.internal_results[email_id].get("processing_attempts", 1)),
                 "comparison status": result["status"],
                 "mismatch fields": ", ".join(result["defect_fields"]) or "—",
                 "review status": (
@@ -202,6 +356,7 @@ def dataset_rows(artifacts: ProcessingArtifacts) -> list[dict[str, str]]:
                     if result["status"] == "NEEDS_REVIEW"
                     else "—"
                 ),
+                "review decision": artifacts.internal_results[email_id].get("review_state", "—"),
             }
         )
     return rows
@@ -221,3 +376,19 @@ def write_artifacts(artifacts: ProcessingArtifacts, output_dir: str | Path) -> N
     write_json(output / "submission.json", artifacts.submission)
     write_json(output / "results.json", artifacts.internal_results)
     write_json(output / "summary.json", artifacts.summary)
+    write_json(
+        output / "errors.json",
+        {
+            email_id: detail.get("error_history", [])
+            for email_id, detail in artifacts.internal_results.items()
+            if detail.get("error_history")
+        },
+    )
+    write_json(
+        output / "review_decisions.json",
+        {
+            email_id: detail["human_review"]
+            for email_id, detail in artifacts.internal_results.items()
+            if detail.get("human_review")
+        },
+    )
