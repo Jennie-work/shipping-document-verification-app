@@ -23,6 +23,7 @@ from src.service import (
     submission_bytes,
     write_artifacts,
 )
+from src.dashboard import normalized_inbox_records, useDashboardStats, useInboxFilters
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -596,15 +597,25 @@ def run_dataset_with_progress(bundle_path: str) -> ProcessingArtifacts:
 
 
 def render_summary(artifacts: ProcessingArtifacts) -> None:
-    summary = artifacts.summary
-    comparison_total = max(summary["comparison_requests"], 1)
-    resolved = summary["mismatch"] + summary["no_mismatch"]
-    resolved_rate = resolved / comparison_total
-    columns = st.columns(4)
-    columns[0].metric("Emails analyzed", summary["emails_processed"])
-    columns[1].metric("Document checks", summary["comparison_requests"])
-    columns[2].metric("Action required", summary["mismatch"] + summary["manual_review"])
-    columns[3].metric("Automatically resolved", f"{resolved_rate:.0%}")
+    records = normalized_inbox_records(
+        artifacts.emails, artifacts.submission, artifacts.internal_results
+    )
+    stats = useDashboardStats(records)
+    cards = (
+        ("Total emails processed", f'{stats["total_emails"]:,}', "Inbox records"),
+        ("Comparison cases", f'{stats["comparison_cases"]:,}', "SI and BL checks"),
+        ("Mismatch count", f'{stats["mismatch_count"]:,}', "Fields requiring correction"),
+        ("Human review", f'{stats["human_review_count"]:,}', "Low confidence or incomplete"),
+        ("Failed cases", f'{stats["failed_cases"]:,}', "Processing or attachment errors"),
+        ("Success rate", f'{stats["success_rate"]:.0%}', "Automatically resolved comparisons"),
+    )
+    columns = st.columns(3)
+    for index, (label, value, caption) in enumerate(cards):
+        with columns[index % 3]:
+            st.markdown(
+                f'<div class="dashboard-card"><div class="dashboard-label">{label}</div><div class="dashboard-number">{value}</div><div style="opacity:.65">{caption}</div></div>',
+                unsafe_allow_html=True,
+            )
 
 
 def render_dataset_table(artifacts: ProcessingArtifacts) -> None:
@@ -695,6 +706,9 @@ def render_action_center(artifacts: ProcessingArtifacts) -> None:
 
 def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
     email_by_id = {email["email_id"]: email for email in artifacts.emails}
+    records = normalized_inbox_records(
+        artifacts.emails, artifacts.submission, artifacts.internal_results
+    )
 
     mismatches = [k for k, v in artifacts.submission.items() if v["status"] == "MISMATCH"]
     reviews = [k for k, v in artifacts.submission.items() if v["status"] == "NEEDS_REVIEW"]
@@ -719,12 +733,13 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
     section_label("Analysis results")
 
     buckets = [
+        ("All files", f"• All files ({len(artifacts.emails)})", list(email_by_id)),
         ("Mismatches", f"! Mismatch ({len(mismatches)})", mismatches),
         ("Human review", f"? Human Review ({len(reviews)})", reviews),
         ("Passed", f"✓ Passed ({len(cleared)})", cleared),
     ]
 
-    cols = st.columns(3)
+    cols = st.columns(4)
 
     for col, (name, label, _) in zip(cols, buckets):
         with col:
@@ -738,6 +753,7 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
             )
 
     choices = {
+        "All files": list(email_by_id),
         "Mismatches": mismatches,
         "Human review": reviews,
         "Passed": cleared,
@@ -748,16 +764,32 @@ def render_inbox_workspace(artifacts: ProcessingArtifacts) -> None:
         unsafe_allow_html=True,
     )
 
-    search = st.text_input(
+    search_col, status_col, type_col, mismatch_col = st.columns([2, 1, 1, 1])
+    search = search_col.text_input(
         "Search files",
-        placeholder="🔍 Search by email ID or subject",
+        placeholder="Search by email ID or subject",
         key=f"search_{st.session_state.inbox_bucket}",
     )
-
-    filtered = [
-        email_id for email_id in choices
-        if search.lower() in f'{email_id} {email_by_id[email_id].get("subject","")}'.lower()
-    ]
+    selected_status = status_col.selectbox(
+        "Status", ["All", "Processing", "Completed", "Review Required", "Failed"],
+        key=f"status_{st.session_state.inbox_bucket}",
+    )
+    selected_type = type_col.selectbox(
+        "Document type", ["All", "SI", "BL", "Invoice", "Unknown"],
+        key=f"document_type_{st.session_state.inbox_bucket}",
+    )
+    selected_mismatch = mismatch_col.selectbox(
+        "Mismatch", ["All", "Has Mismatches", "All Fields Match"],
+        key=f"mismatch_{st.session_state.inbox_bucket}",
+    )
+    filtered_records = useInboxFilters(
+        records,
+        {"status": selected_status, "document_type": selected_type, "mismatch_status": selected_mismatch},
+        search,
+    )
+    filtered = [email_id for email_id in choices if any(
+        record["email_id"] == email_id for record in filtered_records
+    )]
 
     for email_id in filtered[:20]:
 
